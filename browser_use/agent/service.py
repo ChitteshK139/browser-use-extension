@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
+from loguru import logger
 import re
 import time
 from pathlib import Path
@@ -53,10 +53,9 @@ from browser_use.telemetry.views import (
 from browser_use.utils import time_execution_async, time_execution_sync
 
 load_dotenv()
-logger = logging.getLogger(__name__)
 
 
-def log_response(response: AgentOutput) -> None:
+def log_response(response: AgentOutput, trace_id:str) -> None:
 	"""Utility function to log the model's response."""
 
 	if 'Success' in response.current_state.evaluation_previous_goal:
@@ -66,15 +65,14 @@ def log_response(response: AgentOutput) -> None:
 	else:
 		emoji = '🤷'
 
-	logger.info(f'{emoji} Eval: {response.current_state.evaluation_previous_goal}')
-	logger.info(f'🧠 Memory: {response.current_state.memory}')
-	logger.info(f'🎯 Next goal: {response.current_state.next_goal}')
+	logger.info(f'{emoji} Eval: {response.current_state.evaluation_previous_goal}', trace_id=trace_id)
+	logger.info(f'🧠 Memory: {response.current_state.memory}', trace_id=trace_id)
+	logger.info(f'🎯 Next goal: {response.current_state.next_goal}', trace_id=trace_id)
 	for i, action in enumerate(response.action):
-		logger.info(f'🛠️  Action {i + 1}/{len(response.action)}: {action.model_dump_json(exclude_unset=True)}')
+		logger.info(f'🛠️  Action {i + 1}/{len(response.action)}: {action.model_dump_json(exclude_unset=True)}', trace_id=trace_id)
 
 
 Context = TypeVar('Context')
-
 
 class Agent(Generic[Context]):
 	@time_execution_sync('--init (agent)')
@@ -83,6 +81,7 @@ class Agent(Generic[Context]):
 		task: str,
 		llm: BaseChatModel,
 		# Optional parameters
+		trace_id: str,
 		browser: Browser | None = None,
 		browser_context: BrowserContext | None = None,
 		controller: Controller[Context] = Controller(),
@@ -135,6 +134,7 @@ class Agent(Generic[Context]):
 		# Core components
 		self.task = task
 		self.llm = llm
+		self.trace_id = trace_id
 		self.controller = controller
 		self.sensitive_data = sensitive_data
 
@@ -317,14 +317,14 @@ class Agent(Generic[Context]):
 				raise InterruptedError
 
 		if self.state.stopped or self.state.paused:
-			logger.debug('Agent paused after getting state')
+			logger.debug('Agent paused after getting state', trace_id=self.trace_id)
 			raise InterruptedError
 
 	# @observe(name='agent.step', ignore_output=True, ignore_input=True)
 	@time_execution_async('--step (agent)')
 	async def step(self, step_info: Optional[AgentStepInfo] = None) -> None:
 		"""Execute one step of the task"""
-		logger.info(f'📍 Step {self.state.n_steps}')
+		logger.info(f'📍 Step {self.state.n_steps}',trace_id=self.trace_id)
 		state = None
 		model_output = None
 		result: list[ActionResult] = []
@@ -384,7 +384,7 @@ class Agent(Generic[Context]):
 			self.state.last_result = result
 
 			if len(result) > 0 and result[-1].is_done:
-				logger.info(f'📄 Result: {result[-1].extracted_content}')
+				logger.info(f'📄 Result: {result[-1].extracted_content}', trace_id=self.trace_id)
 
 			self.state.consecutive_failures = 0
 
@@ -427,12 +427,12 @@ class Agent(Generic[Context]):
 	@time_execution_async('--handle_step_error (agent)')
 	async def _handle_step_error(self, error: Exception) -> list[ActionResult]:
 		"""Handle all types of errors that can occur during a step"""
-		include_trace = logger.isEnabledFor(logging.DEBUG)
+		include_trace = logger.level("DEBUG").no <= logger.level("")
 		error_msg = AgentError.format_error(error, include_trace=include_trace)
 		prefix = f'❌ Result failed {self.state.consecutive_failures + 1}/{self.settings.max_failures} times:\n '
 
 		if isinstance(error, (ValidationError, ValueError)):
-			logger.error(f'{prefix}{error_msg}')
+			logger.error(f'{prefix}{error_msg}', trace_id=self.trace_id)
 			if 'Max token limit reached' in error_msg:
 				# cut tokens from history
 				self._message_manager.settings.max_input_tokens = self.settings.max_input_tokens - 500
@@ -450,11 +450,11 @@ class Agent(Generic[Context]):
 			from openai import RateLimitError
 
 			if isinstance(error, RateLimitError) or isinstance(error, ResourceExhausted):
-				logger.warning(f'{prefix}{error_msg}')
+				logger.warning(f'{prefix}{error_msg}', trace_id=self.trace_id)
 				await asyncio.sleep(self.settings.retry_delay)
 				self.state.consecutive_failures += 1
 			else:
-				logger.error(f'{prefix}{error_msg}')
+				logger.error(f'{prefix}{error_msg}', trace_id=self.trace_id)
 				self.state.consecutive_failures += 1
 
 		return [ActionResult(error=error_msg, include_in_memory=True)]
@@ -507,16 +507,16 @@ class Agent(Generic[Context]):
 	async def get_next_action(self, input_messages: list[BaseMessage]) -> AgentOutput:
 		"""Get next action from LLM based on current state"""
 		input_messages = self._convert_input_messages(input_messages)
-
+		
 		if self.tool_calling_method == 'raw':
 			output = self.llm.invoke(input_messages)
 			# TODO: currently invoke does not return reasoning_content, we should override invoke
-			output.content = self._remove_think_tags(str(output.content))
+			output.content = self._remove_think_tags(str(output.content))	
 			try:
 				parsed_json = extract_json_from_model_output(output.content)
 				parsed = self.AgentOutput(**parsed_json)
 			except (ValueError, ValidationError) as e:
-				logger.warning(f'Failed to parse model output: {output} {str(e)}')
+				logger.warning(f'Failed to parse model output: {output} {str(e)}', trace_id=self.trace_id)
 				raise ValueError('Could not parse response.')
 
 		elif self.tool_calling_method is None:
@@ -535,15 +535,15 @@ class Agent(Generic[Context]):
 		if len(parsed.action) > self.settings.max_actions_per_step:
 			parsed.action = parsed.action[: self.settings.max_actions_per_step]
 
-		log_response(parsed)
+		log_response(parsed,self.trace_id)
 
 		return parsed
 
 	def _log_agent_run(self) -> None:
 		"""Log the agent run"""
-		logger.info(f'🚀 Starting task: {self.task}')
+		logger.info(f'🚀 Starting task: {self.task}', trace_id=self.trace_id)
 
-		logger.debug(f'Version: {self.version}, Source: {self.source}')
+		logger.debug(f'Version: {self.version}, Source: {self.source}', trace_id=self.trace_id)
 		self.telemetry.capture(
 			AgentRunTelemetryEvent(
 				agent_id=self.state.agent_id,
@@ -592,12 +592,12 @@ class Agent(Generic[Context]):
 			for step in range(max_steps):
 				# Check if we should stop due to too many failures
 				if self.state.consecutive_failures >= self.settings.max_failures:
-					logger.error(f'❌ Stopping due to {self.settings.max_failures} consecutive failures')
+					logger.error(f'❌ Stopping due to {self.settings.max_failures} consecutive failures.', trace_id=self.trace_id)
 					break
 
 				# Check control flags before each step
 				if self.state.stopped:
-					logger.info('Agent stopped')
+					logger.info('Agent stopped',trace_id=self.trace_id)
 					break
 
 				while self.state.paused:
@@ -616,7 +616,7 @@ class Agent(Generic[Context]):
 					await self.log_completion()
 					break
 			else:
-				logger.info('❌ Failed to complete task in maximum steps')
+				logger.info(f'❌ Failed to complete task in maximum steps', trace_id=self.trace_id)
 
 			return self.state.history
 		finally:
@@ -668,7 +668,7 @@ class Agent(Generic[Context]):
 				if check_for_new_elements and not new_path_hashes.issubset(cached_path_hashes):
 					# next action requires index but there are new elements on the page
 					msg = f'Something new appeared after action {i} / {len(actions)}'
-					logger.info(msg)
+					logger.info(msg, trace_id=self.trace_id)
 					results.append(ActionResult(extracted_content=msg, include_in_memory=True))
 					break
 
@@ -741,11 +741,11 @@ class Agent(Generic[Context]):
 
 	async def log_completion(self) -> None:
 		"""Log the completion of the task"""
-		logger.info('✅ Task completed')
+		logger.info(f'✅ Task completed',trace_id=self.trace_id)
 		if self.state.history.is_successful():
-			logger.info('✅ Successfully')
+			logger.info(f'✅ Successfully',trace_id=self.trace_id)
 		else:
-			logger.info('❌ Unfinished')
+			logger.info(f'❌ Unfinished',trace_id=self.trace_id)
 
 		if self.register_done_callback:
 			await self.register_done_callback(self.state.history)
@@ -800,12 +800,12 @@ class Agent(Generic[Context]):
 					retry_count += 1
 					if retry_count == max_retries:
 						error_msg = f'Step {i + 1} failed after {max_retries} attempts: {str(e)}'
-						logger.error(error_msg)
+						logger.error(error_msg, trace_id=self.trace_id)
 						if not skip_failures:
 							results.append(ActionResult(error=error_msg))
 							raise RuntimeError(error_msg)
 					else:
-						logger.warning(f'Step {i + 1} failed (attempt {retry_count}/{max_retries}), retrying...')
+						logger.warning(f'Step {i + 1} failed (attempt {retry_count}/{max_retries}), retrying...',trace_id=self.trace_id)
 						await asyncio.sleep(delay_between_actions)
 
 		return results
